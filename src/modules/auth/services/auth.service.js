@@ -313,7 +313,7 @@ export const verifyResetOTPService = async (email, otp) => {
     throw new AppError("OTP expired or invalid.", 400, "OTP_EXPIRED");
   }
 
-  if (storedOtp !== otp) {
+  if (storedOtp !== parseInt(otp, 10)) {
     const attempts = await redisClient.incr(attemptsKey);
     if (attempts === 1) await redisClient.expire(attemptsKey, OTP_EXPIRATION_SECONDS);
     if (attempts > 5) {
