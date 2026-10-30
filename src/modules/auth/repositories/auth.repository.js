@@ -32,6 +32,17 @@ export const createUser = async (userData) => {
   return newUser;
 };
 
+export const updateUserPassword = async (userId, passwordHash) => {
+  const [updatedUser] = await db
+    .update(users)
+    .set({ passwordHash, updatedAt: new Date() })
+    .where(eq(users.id, userId))
+    .returning();
+  return updatedUser;
+};
+
 export const UserRepository = {
-  findUserByEmail, createUser
+  findUserByEmail, 
+  createUser,
+  updateUserPassword
 };
