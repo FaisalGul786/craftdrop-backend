@@ -16,6 +16,11 @@ const MAX_OTP_REQUESTS_PER_WINDOW = 3;
 // 10-minute session TTL to match middleware sliding strategy
 const SESSION_TTL_SECONDS = 600;
 
+// forgot-password variables
+const RESET_RATE_LIMIT_TTL_SECONDS = 900; // 15 minutes
+const MAX_RESET_REQUESTS_PER_WINDOW = 3;
+const RESET_TOKEN_TTL_SECONDS = 3600; // 60 minutes
+
 
 /**
  * Handles registration business logic.
@@ -197,3 +202,160 @@ export const verifyOTPService = async (payload) => {
 };
 
 
+
+
+
+/**
+ * Handles user login authentication (Redis-first lockout & session generation).
+ * @param {Object} payload - { email, password }
+ */
+export const loginUserService = async (payload) => {
+  const { email, password } = payload;
+  const normalizedEmail = email.toLowerCase().trim();
+
+  const lockoutKey = `login_failures:${normalizedEmail}`;
+
+  // Sequence 9, 10: Check Lockout Status in Redis first
+  const failureCount = await redisClient.get(lockoutKey);
+  if (failureCount && parseInt(failureCount, 10) >= 5) {
+    throw new AppError(
+      "Account temporarily locked due to too many failed attempts. Please try again in 15 minutes.",
+      429,
+      "ACCOUNT_LOCKED"
+    );
+  }
+
+  // Sequence 12, 13: Fetch User from DB
+  const user = await UserRepository.findUserByEmail(normalizedEmail);
+  if (!user) {
+    throw new AppError("Invalid email or password.", 401, "INVALID_CREDENTIALS");
+  }
+
+  // Sequence 16, 17: Check Account Suspension Status
+  if (user.suspendedAt) {
+    throw new AppError("Account has been suspended.", 403, "ACCOUNT_SUSPENDED");
+  }
+
+  // Sequence 19: Verify Password Hash
+  const isPasswordValid = await bcrypt.compare(password, user.passwordHash);
+
+  if (!isPasswordValid) {
+    // Sequence 20, 21, 22: Increment failure tracking and apply 15-min TTL on 5th failure
+    const newCount = await redisClient.incr(lockoutKey);
+    if (newCount === 5) {
+      await redisClient.expire(lockoutKey, 900); 
+    }
+    throw new AppError("Invalid email or password.", 401, "INVALID_CREDENTIALS");
+  }
+
+  // Sequence 25, 26, 27: Successful Login - Clear failures and create session
+  if (failureCount) {
+    await redisClient.del(lockoutKey);
+  }
+
+  const sessionId = await createSessionService(user.id);
+
+  return {
+    sessionId,
+    user: {
+      id: user.id,
+      email: user.email,
+      displayName: user.displayName,
+      role: user.role
+    }
+  };
+};
+
+
+
+
+
+export const requestPasswordResetService = async (email) => {
+  const normalizedEmail = email.toLowerCase().trim();
+  const rateLimitKey = `rl:forgot_pwd:${normalizedEmail}`;
+
+  // Rate Limiting
+  const requestCount = await redisClient.incr(rateLimitKey);
+  if (requestCount === 1) {
+    await redisClient.expire(rateLimitKey, RESET_RATE_LIMIT_TTL_SECONDS);
+  }
+  if (requestCount && parseInt(requestCount, 10) > MAX_RESET_REQUESTS_PER_WINDOW) {
+    throw new AppError("Too many password reset requests. Please try again later.", 429, "RATE_LIMITED");
+  }
+
+  const user = await UserRepository.findUserByEmail(normalizedEmail);
+  
+  if (user) {
+    const otp = generateOTP();
+    const otpKey = `forgot_otp:${normalizedEmail}`;
+    
+    await redisClient.set(otpKey, otp, OTP_EXPIRATION_SECONDS);
+
+    const appUrl = process.env.APP_URL || "http://localhost:5000";
+    await qstashClient.publishJSON({
+      url: `${appUrl}/auth/jobs/send-reset-email`,
+      body: { email: normalizedEmail, displayName: user.displayName, otp },
+      retries: 3,
+    });
+  }
+
+  // Always return same response to prevent enumeration
+  return { success: true };
+};
+
+export const verifyResetOTPService = async (email, otp) => {
+  const normalizedEmail = email.toLowerCase().trim();
+  const otpKey = `forgot_otp:${normalizedEmail}`;
+  const attemptsKey = `forgot_otp_attempts:${normalizedEmail}`;
+
+  const storedOtp = await redisClient.get(otpKey);
+  if (!storedOtp) {
+    throw new AppError("OTP expired or invalid.", 400, "OTP_EXPIRED");
+  }
+
+  if (storedOtp !== parseInt(otp, 10)) {
+    const attempts = await redisClient.incr(attemptsKey);
+    if (attempts === 1) await redisClient.expire(attemptsKey, OTP_EXPIRATION_SECONDS);
+    if (attempts > 5) {
+      await redisClient.del(otpKey, attemptsKey);
+      throw new AppError("Maximum attempts exceeded. Request a new OTP.", 429, "MAX_ATTEMPTS");
+    }
+    throw new AppError("Invalid OTP.", 400, "INVALID_OTP");
+  }
+
+  const user = await UserRepository.findUserByEmail(normalizedEmail);
+  if (!user) throw new AppError("User not found.", 404, "USER_NOT_FOUND");
+
+  // Success: Clean up OTP state
+  await redisClient.del(otpKey, attemptsKey);
+
+  // Generate Reset Token
+  const resetToken = crypto.randomBytes(32).toString("hex");
+  console.log('\n crytographical token generated . . . ', resetToken)
+  const hashedToken = crypto.createHash("sha256").update(resetToken).digest("hex");
+  console.log('\n\n crytographical hash token generated . . . ', hashedToken)
+
+  
+  const tokenKey = `reset_token:${hashedToken}`;
+  await redisClient.set(tokenKey, user.id, RESET_TOKEN_TTL_SECONDS);
+
+  return { resetToken };
+};
+
+export const resetPasswordService = async (resetToken, newPassword) => {
+  const hashedToken = crypto.createHash("sha256").update(resetToken).digest("hex");
+  const tokenKey = `reset_token:${hashedToken}`;
+
+  const userId = await redisClient.get(tokenKey);
+  if (!userId) {
+    throw new AppError("Invalid or expired reset token.", 400, "INVALID_TOKEN");
+  }
+
+  const saltRounds = 10;
+  const passwordHash = await bcrypt.hash(newPassword, saltRounds);
+
+  await UserRepository.updateUserPassword(userId, passwordHash);
+  await redisClient.del(tokenKey);
+
+  return { success: true };
+};

@@ -22,6 +22,10 @@ Development is currently focused on the **Foundation** milestone. We have succes
 
 ### 🔐 Auth & Identity System (Completed)
 - **Email OTP Verification Flow:** Users register via a secure 6-digit OTP sent to their email.
+- **Secure Password Reset Flow:** 
+  - 3-phase architecture (Request, Verify OTP, Update Password) that leverages Redis to protect the database from write-heavy attacks.
+  - Built-in anti-enumeration protection (always returns consistent 200 OK responses).
+  - Cryptographically secure 32-byte reset tokens are exchanged for OTPs. Only their SHA-256 hashes are stored in Redis with a strict 60-minute non-sliding TTL.
 - **Asynchronous Email Dispatch:** Leveraging **Upstash QStash** as a background job worker to trigger transactional emails via the **Brevo ESP**, ensuring the main API thread is never blocked.
 - **Robust Rate Limiting & Security:** 
   - Atomic Redis counters to prevent OTP spam (Max 3 requests per 15 mins).
@@ -79,6 +83,7 @@ CraftDrop is being built iteratively. Here is the roadmap of features currently 
 - [x] Database schemas & Global error handling
 - [x] OTP-based Registration & Email Dispatcher
 - [x] Secure Session Management & Sliding Expiration
+- [x] Secure Password Reset (Forgot Password) Flow
 - [ ] User Login & Logout endpoints
 - [ ] Creator Storefront profiles (Bio, unique URL slugs)
 
